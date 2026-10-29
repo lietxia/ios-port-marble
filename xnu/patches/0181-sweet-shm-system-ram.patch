@@ -1112,7 +1112,7 @@
  static uint32_t    g_shm_handle;
  static int         g_shm_mapped;
  
-@@ -1622,6 +2359,160 @@
+@@ -1622,6 +2359,185 @@
   * The hand-built packet below put the body at offset 24, so the DSP read the
   * pool id as the payload size and answered AR_EBADPARAM.  Build the body in
   * a standalone array and let g_apm_cmd place it correctly. */
@@ -1216,6 +1216,20 @@
 +	uint32_t kg3;
 +	uint32_t pad4;
 +	uint64_t pad5;
++	/* Level 6+: corrected CB window and GPUCC state. */
++	uint32_t cb_base;
++	uint32_t cb_fault;
++	uint32_t cb_sacr;
++	uint32_t cb_sctlr;
++	uint32_t cb_ttbr0;
++	uint32_t cb_tcr;
++	uint32_t cb_mair;
++	uint32_t cb_sctlr_w;
++	uint32_t gpcc_fault;
++	uint32_t gpcc[8];
++	uint32_t gpcc_w[4];
++	uint32_t pad6[3];
++	uint64_t pad7;
 +};
 +
 +static void
@@ -1267,6 +1281,17 @@
 +	printf("SWEET GPU: kgsl %#x %#x %#x %#x last=%u prev=%u magic=%#x\n",
 +	    r->kg0, r->kg1, r->kg2, r->kg3, r->last_step, r->prev_step,
 +	    r->prev_magic);
++	if (r->version >= 6) {
++		printf("SWEET GPU: cb base=%#x f=%#x sacr=%#x sctlr=%#x "
++		    "ttbr0=%#x tcr=%#x mair=%#x wr=%#x\n", r->cb_base,
++		    r->cb_fault, r->cb_sacr, r->cb_sctlr, r->cb_ttbr0,
++		    r->cb_tcr, r->cb_mair, r->cb_sctlr_w);
++		printf("SWEET GPU: gpcc f=%#x %#x %#x %#x %#x %#x %#x %#x "
++		    "%#x w=%#x %#x %#x %#x\n", r->gpcc_fault, r->gpcc[0],
++		    r->gpcc[1], r->gpcc[2], r->gpcc[3], r->gpcc[4],
++		    r->gpcc[5], r->gpcc[6], r->gpcc[7], r->gpcc_w[0],
++		    r->gpcc_w[1], r->gpcc_w[2], r->gpcc_w[3]);
++	}
 +	sweet_log_sync();
 +}
 +

@@ -2280,3 +2280,16 @@ PSCI SYSTEM_RESET（已验证可用）。
 
 待验证：v98 镜像的关机是否真的断电；电量是否每 30 s 更新、拔线后
 充电图标是否消失。
+
+**GPU CB 偏移（2026-10-29，level 6/7）**：复核 SMMU 手册和 marble 真机
+DT 后发现，之前「CB 页不可用」的探针地址是错的。`ARM_SMMU_CB(n) =
+(numpage + n) << pagesize`；apps-smmu 的 `ID1.NUMPAGENDXB=6` 才有
+`CB0=+0x80000`，而 kgsl-smmu 的 `ID1=0x40000016` 是 `NUMPAGENDXB=4`、
+4K 页，**CB0 在 +0x20000**（CB21 在 +0x35000）。之前的 +0x80000 相当于
+访问 CB96，已越过 DT 里 `reg = <0x3da0000 0x40000>` 的窗口，所以
+「一碰就死」更可能是落进地址洞，而不是掉电或 hypervisor 策略。
+新增 shim 探针 level 6（只读：GPUCC `cape-gpucc@0x3d90000` 的 8 个分支
+寄存器 + 按 ID1 算出的 CB 窗口 + sACR）和 level 7（使能 SMMU DT 列出的
+时钟、翻转 CB0.SCTLR.M、最后做 CBAR no-op 写）。GPUCC 的 compatible
+`qcom,cape-gpucc` 也由 `gpucc-waipio.c` 绑定，偏移取自该驱动。结果页新增
+`cb_*` / `gpcc*` 字段，XNU 侧在 `version>=6` 时多打印两行。

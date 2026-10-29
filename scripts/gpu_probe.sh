@@ -1,10 +1,19 @@
 #!/bin/bash
 # kgsl-smmu ownership probe for marble (GPU SMMU, not apps-smmu).
 #
-#   ./scripts/gpu_probe.sh build        # gpu-l1.img, gpu-l4.img, gpu-l5.img
+#   ./scripts/gpu_probe.sh build        # gpu-l1/4/5/6/7.img
 #   ./scripts/gpu_probe.sh run 1        # read-only: ID/SMR/S2CR
 #   ./scripts/gpu_probe.sh run 4        # + S2CR BYPASS/FAULT write test + KGSL read
 #   ./scripts/gpu_probe.sh run 5        # + TRANS S2CR, CBAR(0), CB0.SCTLR writes
+#   ./scripts/gpu_probe.sh run 6        # + GPUCC reads, CB window at ID1's offset
+#   ./scripts/gpu_probe.sh run 7        # + GPUCC clock enables, CB0.SCTLR write test
+#
+# Levels 6/7 exist because the old CB probes used +0x80000, app-smmu's
+# layout.  ARM_SMMU_CB(n) = (numpage + n) << pagesize, and kgsl-smmu reports
+# ID1.NUMPAGENDXB=4 with 4 KiB pages, so its CB0 is at +0x20000; +0x80000
+# is past the end of its 0x40000 register window.  Level 6 re-reads the CB at
+# the encoded offset and dumps GPUCC (cape-gpucc @0x3d90000); level 7 enables
+# the clocks the SMMU DT lists and proves CB0 takes a write.
 #
 # Why the shim does the risky part: an access to a powered-down Qualcomm block
 # raises a synchronous external abort.  XNU would panic and the UFS log would
@@ -101,10 +110,12 @@ build)
 	build_one 1 || exit 1
 	build_one 4 || exit 1
 	build_one 5 || exit 1
+	build_one 6 || exit 1
+	build_one 7 || exit 1
 	;;
 run)
 	lvl="${2:-1}"
-	case "$lvl" in 1|4|5) ;; *) echo "level must be 1, 4 or 5" >&2; exit 2 ;; esac
+	case "$lvl" in 1|4|5|6|7) ;; *) echo "level must be 1, 4, 5, 6 or 7" >&2; exit 2 ;; esac
 	run_one "$lvl"
 	;;
 *)

@@ -79,6 +79,9 @@ SID：`gfx3d_user=0`、`gfx3d_lpac=1`、`gfx3d_secure=2`（DT 里的
 - `2` = + S2CR 写测试
 - `3` = + KGSL 读
 - `4` = 写测试 + KGSL 读
+- `5` = + TRANS S2CR、CBAR(0)/CB0.SCTLR（用 +0x80000，见下文「CB 偏移」）
+- `6` = + GPUCC 读 + **按 ID1 编码的 CB 窗口**（kgsl 是 +0x20000）
+- `7` = 6 + GPUCC 时钟使能 + CB0.SCTLR 写入测试（CBAR 写放最后）
 
 boot 参数必须带 `sweetgpu=1`，否则 XNU 不打印结果页。脚本已经带上了。
 
@@ -189,3 +192,67 @@ CB 页在掉电域里；要打开它需要 GPUCC 时钟、GMU 固件和 kgsl 的
 驱动移植量级的工作，不是再加几个探针能解决的。
 
 **GPU 这条线到此为止**，除非先做 GPUCC/GMU 上电。对音频没有影响。
+
+## 2026-10-29：CB 偏移算错了（level 6/7）
+
+上面「CB 页不可用」的结论建立在一个地址假设上，而这个假设是错的。
+
+ARM SMMU 的 context bank 偏移不是固定的 0x80000：
+
+```
+ARM_SMMU_CB(n) = (numpage + n) << pagesize
+numpage        = 1 << (ID1.NUMPAGENDXB + 1)
+pagesize       = ID1.PAGESIZE ? 64K : 4K
+```
+
+- apps-smmu（0x15000000）的 `ID1.NUMPAGENDXB=6`，所以 **CB0 在 +0x80000**；
+  XNU 侧给音频建页表时用的就是这个值。
+- kgsl-smmu（0x3da0000）的 `ID1=0x40000016`：`NUMPAGENDXB=4`、4K 页
+  ⇒ numpage = 32 页，**CB0 在 +0x20000**，CB21 在 +0x35000。
+- 之前 shim 把 apps-smmu 的 +0x80000 照搬过来，相当于访问 CB96；
+  这已经超出 DT 里 kgsl-smmu 的 `reg = <0x3da0000 0x40000>` 窗口
+  （0x3da0000+0x80000 = 0x3e20000），所以「一碰就死」很可能是**地址落在洞里**，
+  不是掉电，不是 XPU，也不是 hypervisor 的策略。
+
+m5（写 CBAR(0)）的死亡仍待 level 7 复核：CBAR 在 GR1(+0x1000)，
+和 CB 窗口不是一回事。
+
+### level 6 / 7 做什么
+
+- **6（只读）**：
+  1. 读 GPUCC（`cape-gpucc @0x3d90000`，设备树里 `qcom,cape-gpucc`；
+     `gpucc-waipio.c` 也绑定这个 compatible）：
+     `0x911c` AHB、`0x913c` CX_GMU、`0x7000` HLOS1 SMMU 投票、
+     `0x90a8` GX_GFX3D、`0x90bc` GX_GMU、`0x93e8` HUB_AON，
+     外加 SM8550 布局的 GDSC 候选 `0x9108`/`0x905c`；
+  2. 读 sACR（+0x10）；
+  3. 按 ID1 算出的偏移读 CBAR(bank)、CB.SCTLR (+0x0)、TTBR0 (+0x20)、
+     TCR (+0x30)、MAIR0 (+0x38)。
+- **7（写，放在 6 之后单独跑）**：把 SMMU DT 列出的时钟（ahb、cx_gmu、
+  hlos1_vote_gpu_smmu，再加 gx_gfx3d）的 enable 位置 1，回读；
+  然后翻转 CB(bank).SCTLR.M、回读、恢复；最后才做 CBAR 的 no-op 写。
+  如果写后启动消失，下一次启动的 `prev_step` 会指到 150–154。
+
+### 结果页新增字段（`version >= 6` 才打印）
+
+```
+SWEET GPU: cb base=%#x f=%#x sacr=%#x sctlr=%#x ttbr0=%#x tcr=%#x mair=%#x wr=%#x
+SWEET GPU: gpcc f=%#x aa bb cc dd ee ff gg hh w=ii jj kk ll
+```
+
+- `cb base`：ID1 推出来的 CB0 偏移（kgsl 应为 0x20000）；
+- `f`：bit0 CBAR、1 SCTLR、2 TTBR0、4 TCR、8 MAIR、0x20 sACR 写、0x40 sACR 读；
+- `sctlr/ttbr0/tcr/mair`：CB 窗口读回；
+- `wr`：翻转 SCTLR.M 后的回读（只有 level 7 有；能读到非零新值就证明可写）；
+- `gpcc`：8 个 GPUCC 寄存器，`gpcc f` 的 bit0–7 表示对应读取中止，
+  bit8–11 表示对应使能写/回读失败；`w=` 是 level 7 写 enable 后的回读。
+
+### 怎么判读
+
+| 现象 | 结论 |
+|---|---|
+| level 6 进 XNU，`cb base=0x20000`，`f=0`，`sctlr` 不是 0xffffffff | **CB 窗口可达**：之前的「墙」是地址错误，GPU 页表可以建 |
+| level 6 进 XNU，`f&0x02` | CB 窗口这次真的中止了；这时才需要 GPUCC/GMU 上电 |
+| level 6 的 `gpcc` 里 `0x911c`/`0x913c`/`0x7000` 已经非 0（bit0=1） | SMMU 时钟本来就是开的，佐证「不是掉电」 |
+| level 7 `wr` 与 `sctlr` 只差 bit0 | CB.SCTLR 可写；下一步是建页表、写 SMR/S2CR |
+| level 7 下一次启动 `prev=153/154` | CBAR 写仍致命，需要绕开 CBAR（用已有的 S2_TRANS 配置） |

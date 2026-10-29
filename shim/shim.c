@@ -157,12 +157,15 @@ static void irq_handler(void)
  * maps that page and prints it into the normal kernel log.
  *
  * GPU_PROBE_LEVEL (build knob): 1 = SMMU reads, 2 = +S2CR write test,
- * 3 = +KGSL RBBM_STATUS read, 4 = both extras.
+ * 3 = +KGSL RBBM_STATUS read, 4 = both extras, 5 = +TRANS/CBAR/CB0 writes,
+ * 6 = +GPUCC reads and the context-bank window at the offset ID1 actually
+ * encodes, 7 = +clock enable and CB0.SCTLR write test.
  */
 #define GPU_PROBE_PA		0xa2e0f000UL
 #define GPU_PROBE_MAGIC		0x47505550U	/* "GPUP" */
 #define GPU_SMMU_BASE		0x3da0000UL
 #define GPU_KGSL_BASE		0x3d00000UL
+#define GPU_GPUCC_BASE		0x3d90000UL
 #ifndef GPU_PROBE_LEVEL
 #define GPU_PROBE_LEVEL		1
 #endif
@@ -191,13 +194,17 @@ static void irq_handler(void)
 #ifndef GP_KGSL_SCAN
 #define GP_KGSL_SCAN		0	/* read four KGSL offsets */
 #endif
+#ifndef GP_CB_BANK
+#define GP_CB_BANK		-1	/* -1 = bank 0 (level 6+) */
+#endif
 #define GP_STR2(x) #x
 #define GP_STR(x) GP_STR2(x)
 static const char gp_level_tag[] __attribute__((used)) =
     "gpuprobe-" GP_STR(GPU_PROBE_LEVEL)
     "-c" GP_STR(GP_CBAR_BANK) "w" GP_STR(GP_CBAR_WRITE)
     "-s" GP_STR(GP_SCTLR_BANK) "w" GP_STR(GP_SCTLR_WRITE)
-    "-r" GP_STR(GP_CB_REGS) GP_STR(GP_GR1_READ) GP_STR(GP_KGSL_SCAN);
+    "-r" GP_STR(GP_CB_REGS) GP_STR(GP_GR1_READ) GP_STR(GP_KGSL_SCAN)
+    "-b" GP_STR(GP_CB_BANK);
 
 /* Keep this layout identical to the copy in bsd/dev/sweet_glink.c. */
 struct gpu_probe_result {
@@ -258,7 +265,22 @@ struct gpu_probe_result {
 	uint32_t kg3;		/* 0xe4 */
 	uint32_t pad4;		/* 0xe8 */
 	uint64_t pad5;		/* 0xf0 */
-};				/* 0xf8 */
+	/* Level 6+: corrected CB window and GPUCC state. */
+	uint32_t cb_base;	/* 0xf8 CB0 offset derived from ID1 */
+	uint32_t cb_fault;	/* 0xfc bit0 CBAR, 1 SCTLR, 2 TTBR0, 4 TCR,
+				 * 8 MAIR, 0x20 sACR, 0x40 sACR read */
+	uint32_t cb_sacr;	/* 0x100 SMMU sACR */
+	uint32_t cb_sctlr;	/* 0x104 CB.SCTLR */
+	uint32_t cb_ttbr0;	/* 0x108 */
+	uint32_t cb_tcr;	/* 0x10c */
+	uint32_t cb_mair;	/* 0x110 */
+	uint32_t cb_sctlr_w;	/* 0x114 readback after toggling SCTLR.M */
+	uint32_t gpcc_fault;	/* 0x118 bit0-7 reads, 8-11 enable writes */
+	uint32_t gpcc[8];	/* 0x11c..0x138 GPUCC registers */
+	uint32_t gpcc_w[4];	/* 0x13c..0x148 readback after enabling */
+	uint32_t pad6[3];	/* 0x14c */
+	uint64_t pad7;		/* 0x158 */
+};				/* 0x160 */
 
 static volatile int gp_busy;
 static volatile int gp_fault;
@@ -330,6 +352,17 @@ gp_wr32(uintptr_t a, uint32_t v)
 	__asm__ volatile("dsb sy" ::: "memory");
 	gp_busy = 0;
 }
+
+#if GPU_PROBE_LEVEL >= 6
+/*
+ * GPUCC branch registers from gpucc-waipio.c, which also binds
+ * "qcom,cape-gpucc" (marble's GPUCC): ahb, cx_gmu, the SMMU vote,
+ * gx_gfx3d, gx_gmu, hub_aon, then the sm8550-layout GDSC candidates.
+ */
+static const uint32_t gpcc_off[8] = {
+	0x911c, 0x913c, 0x7000, 0x90a8, 0x90bc, 0x93e8, 0x9108, 0x905c
+};
+#endif
 
 static void
 gpu_probe_boot(void)
@@ -587,6 +620,153 @@ wdone:
 	r->mair = gp_rd32(s + 0x80038u);
 	if (gp_fault)
 		r->op_fault |= 0x8000u;
+#endif
+
+#if GPU_PROBE_LEVEL >= 6
+	/*
+	 * The CB probe above uses +0x80000, which is app-smmu's layout: its
+	 * ID1.NUMPAGENDXB is 6, so numpage is 128 pages and CB0 sits at
+	 * +0x80000.  kgsl-smmu reports NUMPAGENDXB=4, i.e. CB0 at +0x20000;
+	 * +0x80000 is 96 context banks past the end of its 0x40000 window.
+	 * Re-ask the question with the offset ID1 actually encodes, and read
+	 * GPUCC in the same pass: if the CB page still hangs, power is the
+	 * remaining explanation.
+	 */
+	{
+		uint32_t ndxb = (r->id1 >> 28) & 7u;
+		uint32_t pgshift = (r->id1 & 0x80000000u) ? 16u : 12u;
+		uint32_t cbstride = 1u << pgshift;
+		uint32_t cb0 = (1u << (ndxb + 1u)) << pgshift;
+		int bank = (GP_CB_BANK >= 0) ? (int)GP_CB_BANK : 0;
+		uint32_t f = 0;
+
+		r->cb_base = cb0;
+		if (bank < 0 || bank >= (int)r->num_cb ||
+		    cb0 + cbstride * (uint32_t)bank + 0x40u > 0x40000u)
+			bank = -1;
+
+		r->last_step = 110;
+		r->cb_sacr = gp_rd32(s + 0x10);
+		if (gp_fault)
+			f |= 0x40u;
+
+		if (bank >= 0) {
+			uintptr_t w = s + cb0 + cbstride * (uint32_t)bank;
+
+			r->last_step = 111;
+			r->cbar_bank = (uint32_t)bank;
+			r->cbar_r = gp_rd32(s + 0x1000u + 4u * (uint32_t)bank);
+			if (gp_fault)
+				f |= 0x01u;
+			r->last_step = 112;
+			r->cb_sctlr = gp_rd32(w + 0x00);
+			if (gp_fault)
+				f |= 0x02u;
+			r->last_step = 113;
+			r->cb_ttbr0 = gp_rd32(w + 0x20);
+			if (gp_fault)
+				f |= 0x04u;
+			r->last_step = 114;
+			r->cb_tcr = gp_rd32(w + 0x30);
+			if (gp_fault)
+				f |= 0x08u;
+			r->last_step = 115;
+			r->cb_mair = gp_rd32(w + 0x38);
+			if (gp_fault)
+				f |= 0x10u;
+		}
+
+		/*
+		 * GPUCC last: a hang here must not erase the CB answer, which
+		 * is already on DRAM.  Read-only unless level 7.
+		 */
+		for (i = 0; i < 8; i++) {
+			r->last_step = 120 + i;
+			r->gpcc[i] = gp_rd32(GPU_GPUCC_BASE + gpcc_off[i]);
+			if (gp_fault)
+				r->gpcc_fault |= 1u << i;
+		}
+
+#if GPU_PROBE_LEVEL >= 7
+		if (bank >= 0) {
+			uintptr_t w = s + cb0 + cbstride * (uint32_t)bank;
+
+			/*
+			 * Enable the clocks the SMMU's own DT list enables
+			 * (ahb, cx_gmu, hlos1_vote_gpu_smmu) plus gx_gfx3d,
+			 * then prove the CB page takes writes by toggling
+			 * SCTLR.M and restoring it.  Nothing maps to this CB,
+			 * so the toggle cannot change device traffic.
+			 */
+			{
+				uint32_t v;
+
+				for (i = 0; i < 4; i++) {
+					r->last_step = 140 + i;
+					v = gp_rd32(GPU_GPUCC_BASE + gpcc_off[i]);
+					if (gp_fault) {
+						r->gpcc_fault |= 1u << (8 + i);
+						continue;
+					}
+					gp_wr32(GPU_GPUCC_BASE + gpcc_off[i],
+					    v | 1u);
+					if (gp_fault)
+						r->gpcc_fault |= 1u << (8 + i);
+					r->last_step = 145 + i;
+					r->gpcc_w[i] = gp_rd32(
+					    GPU_GPUCC_BASE + gpcc_off[i]);
+					if (gp_fault)
+						r->gpcc_fault |= 1u << (8 + i);
+				}
+			}
+
+			if (!(f & 0x02u)) {	/* only touch a value we read */
+				r->last_step = 150;
+				gp_wr32(w + 0x00, r->cb_sctlr ^ 1u);  /* .M */
+				if (gp_fault) {
+					f |= 0x02u;
+				} else {
+					r->last_step = 151;
+					r->cb_sctlr_w = gp_rd32(w + 0x00);
+					if (gp_fault)
+						f |= 0x02u;
+					gp_wr32(w + 0x00, r->cb_sctlr);
+					if (gp_fault)
+						f |= 0x02u;
+				}
+			}
+
+			/*
+			 * CBAR writes aborted on apps-smmu even with
+			 * sACR.CACHE_LOCK clear.  Try again here, last: a
+			 * no-op write of the value just read.
+			 */
+			if (!(f & 0x01u)) {
+				r->last_step = 152;
+				if (!(f & 0x40u) && (r->cb_sacr & (1u << 26))) {
+					gp_wr32(s + 0x10,
+					    r->cb_sacr & ~(1u << 26));
+					if (gp_fault)
+						f |= 0x20u;
+					r->cb_sacr = gp_rd32(s + 0x10);
+					if (gp_fault)
+						f |= 0x20u;
+				}
+				r->last_step = 153;
+				gp_wr32(s + 0x1000u + 4u * (uint32_t)bank,
+				    r->cbar_r);
+				if (gp_fault)
+					f |= 0x01u;
+				r->last_step = 154;
+				r->cbar_w = gp_rd32(s + 0x1000u +
+				    4u * (uint32_t)bank);
+				if (gp_fault)
+					f |= 0x01u;
+			}
+		}
+#endif
+		r->cb_fault = f;
+	}
 #endif
 
 	if (GPU_PROBE_LEVEL >= 3) {
