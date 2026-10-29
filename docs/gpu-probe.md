@@ -219,6 +219,14 @@ m5（写 CBAR(0)）的死亡仍待 level 7 复核：CBAR 在 GR1(+0x1000)，
 
 ### level 6 / 7 做什么
 
+> 这两个级别只在 fork（`lietxia/ios-port-marble`）的 CI 里构建内核。
+> 取内核时把仓库指过去：
+>
+> ```bash
+> GH_REPO=lietxia/ios-port-marble ./scripts/fetch_kernel.sh
+> ./scripts/gpu_probe.sh build && ./scripts/gpu_probe.sh run 6
+> ```
+
 - **6（只读）**：
   1. 读 GPUCC（`cape-gpucc @0x3d90000`，设备树里 `qcom,cape-gpucc`；
      `gpucc-waipio.c` 也绑定这个 compatible）：
