@@ -105,12 +105,15 @@ context bank 的权限；安卓有（能写 CBAR(52)）。
 
 - 电源：`sweet_glink.c` 里 `g_batt_probe()`（`sweetbatt=1` 开启）。
   ADSP 每轮都会发 `OPEN PMIC_RTR_ADSP_APPS`（rcid=6），我们回 ACK 并开
-  LCID 2，用 24B `GET_PROP`（owner 0x800A）读 6 个属性。
+  LCID 2，用 24B `GET_PROP`（owner 0x800A）读属性。
   显示侧由 `SweetBattery::poll()` 经 `sweet_batt_get()` 取用（0184）。
-  **已实测（run84）**：`ack=1 remote=1 rcid=6`，6 个请求都有回应，但全部
-  解析成 `prop=0 value=1` ⇒ **响应字段偏移不对**；v25 起 dump 原始 hex。
-  **下一步**：跑一轮 `sweetbatt=1` 看 hexdump，对照安卓
-  `su -c 'cat /sys/class/power_supply/battery/uevent'`。
+  v91 把 property 从 +12 改到 +16 后，状态/容量/电压/电流都取到真实值
+  （capacity 是 0.01%，v93 除对）。v99 又加了 health/present、温度
+  13/12 与库仑 15/14 的双槽、循环 16、USB 电压/类型、`type==2` 通知解析、
+  `kern.sweetbatt{cap,mv,ma,temp,cycle}`，以及 `sweetbattsweep=1` 全表扫描。
+  **下一步**：跑 `./scripts/mkimage.sh sweetbattsweep=1`，对照 ring 里的
+  `SWEET BATT: sweep-*` 和安卓
+  `su -c 'cat /sys/class/power_supply/battery/uevent'` 确认编号。
 - 震动：`sweet_haptics_kick()`（`sweet_glink.c`），由
   `sweet_hid_key(0, down)` 在电源键按下时调用（0183）。
   **已真机验证**（按电源键有反馈）。手动触发仍是 `sysctl -w kern.sweetvibe=1`。

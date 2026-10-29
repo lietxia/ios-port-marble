@@ -234,8 +234,14 @@ docs/                      硬件状态、音频、SMMU、GPU 探针、SWEETLOG 
 
 1. **音频**：抓厂商那块 18 KB 的 APM 级 SET_CFG；拿到后才能让 DSP 读
    PCM 共享内存而不冻结。
-2. **电池**：真机跑一次 `sweetbatt=1 sweetbattsweep=1`，确认属性表编号和
-   `kern.sweetbatt*`；再验证拔线后充电图标消失。
+2. **电池**：真机跑一次属性表扫描，确认编号和 sysctl，再验证拔线后
+   充电图标消失：
+
+   ```bash
+   D22AP_ADT=/path/to/d22ap.adt ./scripts/mkimage.sh sweetbattsweep=1
+   SERIAL=2aa26095 ./scripts/boot_ram.sh images/shim-iosroot-adsp.img
+   # ring 里搜 "SWEET BATT: sweep" 与 "sample"，再 sysctl kern.sweetbatt*
+   ```
 3. **GPU**：先跑 level 6/7，确认 CB0 是否可写、GPUCC 时钟是否可控；之后
    才谈 KGSL 初始化。
 4. **背光**：实现 DSI DCS `0x51` 写入，需要先确定 marble 面板的具体 panel。
