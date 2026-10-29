@@ -6,7 +6,7 @@
 >
 > 本文是入口；细节都在 `docs/`，按下面的索引查。
 
-## 一、现在能做什么（2026-10-27，内核 v90）
+## 一、现在能做什么（2026-10-29，内核 v99；逐轮结论见 status-log）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -15,9 +15,9 @@
 | UFS root | ✅ | userdata 尾部的 HFS+ 镜像 |
 | 8 核 SMP | ✅ | GICR stride 0x40000 修复后 8/8 起核，调度器分配工作 |
 | ADSP / GLINK / GPR / APM 控制面 | ✅ | GRAPH_OPEN/PREPARE/START、TDM SET_CFG 全 status 0 |
-| GPU SMMU（kgsl-smmu） | 🟡 探测完成 | 全局寄存器可读，SMR/S2CR=TRANS 可写，BYPASS 被禁，CB 页访问挂死 |
+| GPU SMMU（kgsl-smmu） | 🟡 只读探针 | SMR/S2CR=TRANS 可写、BYPASS 被禁；level 6/7 按 ID1 算出的 CB0=+0x20000 重新探测（gpu-probe.md） |
 | 音频出声 | ⏸ 暂停 | 挂死原因已找到（见下），DSP 仍不回 DATA_BUFFER_DONE |
-| 电池 | 🟡 通道已开 | pmic_glink 能 open，属性请求的响应格式不对 |
+| 电池 | 🟡 已取到真实值 | v91 修正属性偏移；v99 双温度/库仑槽 + `sweetbattsweep` 自检，待真机确认 |
 | RTC | 🟡 读到了 | PMK8350 RTC 由 EE4（ADSP）拥有，AP 写入被拒 |
 
 ## 二、几个必须知道的结论
@@ -35,10 +35,12 @@ marble 的 redistributor 间距是 **0x40000**，XNU 默认 **0x20000**。
 （`mkimage.sh` 默认已带）。AMP / E-P 调度需要 CLPC/Edge policy，暂时
 没跑起来（`docs/status-log.md`）。
 
-### 3. GPU：CB 页不可达
+### 3. GPU：CB 偏移曾经算错
 `kgsl-smmu` 的 `0x0000..0x1FFF` 可读写（SMR、S2CR=TRANS 都能保持），
-但 `0x80000+` 的 context bank 页一碰就整机挂死；BYPASS 被上层改写为
-FAULT。没有 CB 就建不了页表。详见 `docs/gpu-probe.md`。
+旧探针用 `+0x80000` 访问 CB——那是 apps-smmu（NUMPAGENDXB=6）的布局；
+kgsl-smmu 的 ID1 是 `0x40000016`（NUMPAGENDXB=4、4K 页），CB0 在
+**+0x20000**，`+0x80000` 已越过 DT 的 0x40000 窗口。level 6/7 只读探针
+按正确偏移重测 CB0 和 GPUCC，等真机结果。详见 `docs/gpu-probe.md`。
 
 ### 4. RTC：AP 没有写权限
 PMK8350 RTC（SID 0，ctrl `0x6146`、write `0x6140..0x6143`、read `0x6148`）
@@ -49,10 +51,13 @@ PMK8350 RTC（SID 0，ctrl `0x6146`、write `0x6140..0x6143`、read `0x6148`）
 **iOS 的时间实际来自 `sweettime`**（构建镜像时写入 cmdline），不依赖 PMIC
 RTC；要真正持久化 RTC 需走 ADSP/PMIC 固件的服务，不建议抢 APID 所有权。
 
-### 5. 电池：通道能开，协议还没对上
-`PMIC_RTR_ADSP_APPS` 能 open（ack=1、remote=1、rcid=6），请求也发出去了，
-但返回的 24 字节看起来是请求回显/ack，不是属性值（所有请求都解析成 1）。
-需要对厂商的 pmic_glink 收发做一次抓包（和当年抓 GPR 一样的方法）。
+### 5. 电池：属性偏移已修正，表号待确认
+`pmic_glink` 的 PMIC_RTR_ADSP_APPS 通道能开（ack=1、remote=1），v91 把
+property 从 +12 改到 +16 后 capacity/voltage/current 都能取到真实值
+（capacity 是 0.01%，v93 才除对）。v99 增加：vendor 固件在温度前多插
+一项时温度/库仑的第二个槽（13/15）、`type==2` 通知解析、
+`kern.sweetbatt*` 只读 sysctl，以及 `sweetbattsweep=1` 开机全表扫描。
+下一步只需真机确认这份固件用哪套编号。
 
 ## 三、构建与启动
 
@@ -88,8 +93,8 @@ KEEPALIVE=1 CPUS=8 ./scripts/mkimage.sh \
 
 ## 五、下一步
 
-1. **电池**：抓厂商 pmic_glink 的收发（`dumpsys battery` 时），把属性
-   ID/响应偏移对上；接上后 `SweetBattery` 会自动用 `sweet_batt_get()`。
+1. **电池**：真机跑 `sweetbatt=1 sweetbattsweep=1`，确认属性表编号和
+   `kern.sweetbatt*`，再验证拔线后充电图标消失。
 2. **RTC**：找 ADSP 的 RTC 服务（或 pmic_glink 里的 RTC client），在 ADSP
    侧设置时间；AP 直接写 SPMI 已被证明不通。
 3. **启动时间**：kernel 到 launchd 约 39 秒（4 核/8 核一样），需要打点找

@@ -2294,7 +2294,7 @@ DT 后发现，之前「CB 页不可用」的探针地址是错的。`ARM_SMMU_C
 `qcom,cape-gpucc` 也由 `gpucc-waipio.c` 绑定，偏移取自该驱动。结果页新增
 `cb_*` / `gpcc*` 字段，XNU 侧在 `version>=6` 时多打印两行。
 
-### 2026-10-29 07:4x —— v99：battmgr 属性表补全、通知解析、sweep 自检；同类实现调研
+### 2026-10-29 15:2x —— v99：battmgr 属性表补全、通知解析、sweep 自检；同类实现调研
 
 **属性号**：0..11 与 mainline `qcom_battmgr.c` 一致；vendor 固件在温度前多插
 一项，HakiOS 在同一 ADSP 族上实测 temp=13、charge counter=15、cycles=16、
