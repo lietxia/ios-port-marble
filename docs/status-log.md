@@ -2293,3 +2293,37 @@ DT 后发现，之前「CB 页不可用」的探针地址是错的。`ARM_SMMU_C
 时钟、翻转 CB0.SCTLR.M、最后做 CBAR no-op 写）。GPUCC 的 compatible
 `qcom,cape-gpucc` 也由 `gpucc-waipio.c` 绑定，偏移取自该驱动。结果页新增
 `cb_*` / `gpcc*` 字段，XNU 侧在 `version>=6` 时多打印两行。
+
+### 2026-10-29 07:4x —— v99：battmgr 属性表补全、通知解析、sweep 自检；同类实现调研
+
+**属性号**：0..11 与 mainline `qcom_battmgr.c` 一致；vendor 固件在温度前多插
+一项，HakiOS 在同一 ADSP 族上实测 temp=13、charge counter=15、cycles=16、
+design=17、full=18。marble 这份固件可能落在任一编号，所以温度同时读 13/12、
+库仑同时读 15/14，用合理性区间取真值：温度 5–90 °C（0.01 °C 单位，mainline
+把固件值除以 10 得到 0.1 °C 可证），库仑 0.1–20 Ah，循环 <5000。原来的
+`prop=12` 单一温度和只读状态/容量/电压/电流都保留。
+
+**新增**：health/present、USB 电压/电流/类型；`type==2` 的固件通知不再被
+当成响应（前 8 条打印 opcode 和三个字）；`kern.sweetbatt{cap,mv,ma,temp,cycle}`
+只读 sysctl，方便在 iOS 里 `sysctl` 取数而不必拉 ring；tick 从 5 个请求
+扩到 7 个（两个温度槽），频率仍是 5 s、每 6 次打印一行 30 s 摘要。
+
+**`sweetbattsweep=1`**：开机探测后把 battery 0..31、USB 0..11 全扫一遍并打印
+原始值。属性表是否整体右移、`0x50`（小米私有 BC_XM_STATUS_GET）是否存在，
+一次开机就能确认，不必反复改代码重跑 CI。
+
+build tag 升到 **v99**。v97 已含 intent 回收修复（日志里“v98 镜像”只是对
+下一次构建的称呼，代码里从未打印过 v98），这次是 v97 之后第一次再改这个文件。
+
+**同类实现调研**：
+- 上游 `jebbranch/ios-port-marble` 仍停在 `a7b9177`；fork
+  `G3134377393/ios-port-marble` 领先 18 个提交，含 Adreno 725 stage-1 MMIO
+  probe、GPUCC GDSC 读取、HFS 大端写修复，是 GPU level 6/7 之后最直接的参考。
+- UniXNU 的 [marble 页](https://unixnu.com/devices/marble) 全部标 planned；
+  其 Adreno740 驱动不适用于 SM7475。
+- HakiOS（`oosexgang/hakios-xnu-kernel`）有 WCN6750 WiFi、AW86927 触觉、
+  battmgr、摄像头，是 WiFi/触觉路线的主要参考。
+- ios-sweet 的 `0072`–`0081` 补丁是 DWC3 device 模式 + CDC-ECM 的现成参考。
+- 背光：marble 是 OLED，vendor 走 `bl_ctrl_dcs`（DSI DCS 0x51），既不是
+  WLED，也没有任何 XNU 实现可借；RTC 的 PMK8350 EE4 归属没有项目绕过；
+  marble 面板 DTS 未找到。

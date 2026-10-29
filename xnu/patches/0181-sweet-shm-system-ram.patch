@@ -37,7 +37,7 @@
  #define G_NRIIDS 256           /* the ADSP advertises ~120 of them */
  static struct g_riid g_riids[G_NRIIDS];
  static int           g_nriids;
-@@ -137,6 +153,24 @@
+@@ -137,6 +153,70 @@
  static uint8_t  g_rsp[G_INTENT_SIZE];
  static uint32_t g_rsp_len;
  static int      g_rsp_ready;
@@ -50,6 +50,33 @@
 +#define G_BATT_NAME	"PMIC_RTR_ADSP_APPS"
 +#define G_BATT_NAME_LEN	19u	/* 18 chars + NUL */
 +
++/*
++ * Property numbers.  0..11 are qcom_battmgr.c's; the vendor firmware
++ * inserts one property before the temperature, which shifts the rest by
++ * one (a HakiOS run measured temp 13, charge counter 15, cycles 16,
++ * design 17, full 18 on the same ADSP family).  Marble's build may sit on
++ * either numbering, so both temperature and counter slots are read and
++ * the value that passes a plausibility check is kept; sweetbattsweep=1
++ * dumps every id so the numbering can be confirmed on the device.
++ */
++#define BATT_GET		0x30u
++#define USB_GET			0x32u
++#define BATT_P_STATUS		0
++#define BATT_P_HEALTH		1
++#define BATT_P_PRESENT		2
++#define BATT_P_CAPACITY		4
++#define BATT_P_VOLT_NOW		7
++#define BATT_P_CURR_NOW		9
++#define BATT_P_TEMP_A		12	/* mainline slot */
++#define BATT_P_TEMP_B		13	/* vendor shifted slot */
++#define BATT_P_COUL_A		14
++#define BATT_P_COUL_B		15
++#define BATT_P_CYCLES		16
++#define USB_P_ONLINE		0
++#define USB_P_VOLT_NOW		1
++#define USB_P_CURR_NOW		3
++#define USB_P_TYPE		6
++
 +static uint32_t g_batt_rcid;
 +static int      g_batt_acked, g_batt_remote;
 +static uint8_t  g_batt_rsp[64];
@@ -58,11 +85,30 @@
 +/* Last sample, consumed by SweetBattery.  -1 means "not read yet". */
 +static int g_batt_s_status = -1, g_batt_s_cap = -1, g_batt_s_mv = -1;
 +static int g_batt_s_ma, g_batt_s_usb = -1;
++static int g_batt_s_temp = -100000;	/* 0.01 degC, -1000.00 unknown */
++static int g_batt_s_coul = -1;		/* uAh */
++static int g_batt_s_cycles = -1;
++static int g_batt_s_health = -1, g_batt_s_present = -1;
++static int g_batt_s_usb_type = -1, g_batt_s_usb_mv = -1;
++static int g_batt_s_usb_ma;
++static int g_batt_notices;
++static int g_batt_sweep;
 +static int g_batt_chan;
++
++SYSCTL_INT(_kern, OID_AUTO, sweetbattcap, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &g_batt_s_cap, 0, "battmgr capacity in percent, -1 unknown");
++SYSCTL_INT(_kern, OID_AUTO, sweetbattmv, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &g_batt_s_mv, 0, "battmgr battery voltage in mV, -1 unknown");
++SYSCTL_INT(_kern, OID_AUTO, sweetbattma, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &g_batt_s_ma, 0, "battmgr current in mA, positive charging");
++SYSCTL_INT(_kern, OID_AUTO, sweetbatttemp, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &g_batt_s_temp, 0, "battmgr temperature in 0.01 degC, -100000 unknown");
++SYSCTL_INT(_kern, OID_AUTO, sweetbattcycle, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &g_batt_s_cycles, 0, "battmgr cycle count, -1 unknown");
  
  static void
  g_wait(unsigned ms)
-@@ -176,6 +210,21 @@
+@@ -176,6 +256,21 @@
  	return win + off;
  }
  
@@ -84,7 +130,7 @@
  static void
  g_win_free(vm_offset_t win, vm_size_t size)
  {
-@@ -307,7 +356,8 @@
+@@ -307,7 +402,8 @@
  
  /* Send a GLINK data message (16-byte header + payload). */
  static void
@@ -94,7 +140,7 @@
  {
  	/* One probe thread only, so a static buffer is fine; GLINK messages
  	 * are 16-byte header + payload and must not be truncated (a 360-byte
-@@ -320,8 +370,8 @@
+@@ -320,8 +416,8 @@
  	}
  	msg[0] = CMD_TX_DATA;
  	msg[1] = 0;
@@ -105,7 +151,7 @@
  	msg[4] = (uint8_t)(iid & 0xff);
  	msg[5] = (uint8_t)(iid >> 8);
  	msg[6] = (uint8_t)(iid >> 16);
-@@ -348,6 +398,12 @@
+@@ -348,6 +444,12 @@
  }
  
  static void
@@ -118,7 +164,7 @@
  g_send_version(void)
  {
  	g_send(CMD_VERSION, (uint16_t)GLINK_VERSION_1, GLINK_FEATURE_REUSE,
-@@ -376,7 +432,7 @@
+@@ -376,7 +478,7 @@
  }
  
  static void
@@ -127,7 +173,7 @@
  {
  	uint8_t buf[8];
  
-@@ -388,17 +444,43 @@
+@@ -388,17 +490,43 @@
  	buf[5] = (uint8_t)(id >> 8);
  	buf[6] = (uint8_t)(id >> 16);
  	buf[7] = (uint8_t)(id >> 24);
@@ -173,7 +219,7 @@
  		if (r->in_use || r->size < len) {
  			continue;
  		}
-@@ -409,6 +491,17 @@
+@@ -409,6 +537,17 @@
  	return best;
  }
  
@@ -191,7 +237,7 @@
  static int
  g_rx_one(void)
  {
-@@ -464,6 +557,19 @@
+@@ -464,6 +603,19 @@
  			/* The rcid of *our* channel, not of the last OPEN. */
  			g_rcid = p1;
  			g_remote_open = 1;
@@ -211,7 +257,7 @@
  		}
  		g_rx_advance((8 + p2 + 7u) & ~7u);
  		break;
-@@ -471,7 +577,11 @@
+@@ -471,7 +623,11 @@
  
  	case CMD_OPEN_ACK:
  		printf("SWEET GLINK: OPEN_ACK lcid=%u\n", p1);
@@ -224,7 +270,7 @@
  		g_rx_advance(8);
  		break;
  
-@@ -506,6 +616,7 @@
+@@ -506,6 +662,7 @@
  				for (int k = 0; k < g_nriids; k++) {
  					if (g_riids[k].id == id) {
  						g_riids[k].size = size;
@@ -232,7 +278,7 @@
  						g_riids[k].in_use = 0;
  						found = 1;
  						break;
-@@ -514,6 +625,7 @@
+@@ -514,6 +671,7 @@
  				if (!found && g_nriids < G_NRIIDS) {
  					g_riids[g_nriids].id = id;
  					g_riids[g_nriids].size = size;
@@ -240,7 +286,7 @@
  					g_riids[g_nriids].in_use = 0;
  					g_nriids++;
  				}
-@@ -528,16 +640,64 @@
+@@ -528,16 +686,64 @@
  		for (int i = 0; i < g_nliids; i++) {
  			if (g_liids[i].id == p2) {
  				g_liids[i].filled = 0;
@@ -308,7 +354,7 @@
  
  	case CMD_RX_INTENT_REQ_ACK:
  		printf("SWEET GLINK: intent req ack granted=%u\n", p2);
-@@ -567,6 +727,54 @@
+@@ -567,6 +773,54 @@
  		if (avail < 16 + chunk) {
  			return -1;
  		}
@@ -363,7 +409,7 @@
  		for (int i = 0; i < g_nliids; i++) {
  			if (g_liids[i].id != liid) {
  				continue;
-@@ -663,7 +871,7 @@
+@@ -663,7 +917,7 @@
  	unsigned i = 0;
  
  	while (i < ms) {
@@ -372,7 +418,7 @@
  			return 1;
  		}
  		g_drain(0);
-@@ -671,7 +879,7 @@
+@@ -671,7 +925,7 @@
  		i += 5;
  	}
  	g_drain(0);
@@ -381,7 +427,7 @@
  }
  
  static void
-@@ -682,7 +890,7 @@
+@@ -682,7 +936,7 @@
  	if (len > 4096) {
  		len = 4096;
  	}
@@ -390,7 +436,7 @@
  		printf("SWEET GLINK: requesting %u-byte intent\n", len);
  		g_send(CMD_RX_INTENT_REQ, (uint16_t)g_lcid, len, NULL, 0);
  		if (!g_wait_riid(len, 5000)) {
-@@ -691,7 +899,7 @@
+@@ -691,7 +945,7 @@
  			return;
  		}
  	}
@@ -399,7 +445,7 @@
  	if (r == NULL) {
  		return;
  	}
-@@ -919,7 +1127,7 @@
+@@ -919,7 +1173,7 @@
  static void
  g_mmio_dump(const char *tag, uint64_t pa, unsigned n)
  {
@@ -408,7 +454,7 @@
  
  	if (!v) {
  		printf("SWEET MMIO: %s: map failed\n", tag);
-@@ -953,31 +1161,49 @@
+@@ -953,31 +1207,49 @@
  }
  
  /*
@@ -478,7 +524,7 @@
  	sweet_log_sync();
  }
  
-@@ -1025,8 +1251,10 @@
+@@ -1025,8 +1297,10 @@
  	printf("hboost-follow=%#x\n",
  	    sweet_spmi_read(3, 0xf241, &v) == 0 ? v : 0xffu);
  
@@ -491,7 +537,7 @@
  	g_hap_wr(0xf049, 0x01, "wave");
  	/* Open-loop LRA period: 5882 us / 5 us per step = 0x0498. */
  	{
-@@ -1121,7 +1349,78 @@
+@@ -1121,7 +1395,78 @@
  SYSCTL_PROC(_kern, OID_AUTO, sweetvibe,
      CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY, 0, 0,
      sweet_vibe_sysctl, "I", "trigger the PM8350B haptics engine");
@@ -570,7 +616,7 @@
  static void
  g_dump(const char *tag, const uint8_t *p, uint32_t len)
  {
-@@ -1522,8 +1821,313 @@
+@@ -1522,8 +1867,313 @@
  	0x33, 0x43, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x40, 0x00, 0x00,
  	0x01, 0x00, 0x00, 0x00, 0x07, 0x40, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
  	0x00, 0x00, 0x00, 0x00,
@@ -884,7 +930,7 @@
  #define APM_CMD_GRAPH_OPEN                  0x01001000u
  #define APM_CMD_GRAPH_PREPARE               0x01001001u
  #define APM_CMD_GRAPH_START                 0x01001002u
-@@ -1537,13 +2141,47 @@
+@@ -1537,13 +2187,47 @@
  #define G_TDM_MODULE_ID                     0x0700100eu
  #define G_INPUT_MODULE_OFF                  216u
  #define APM_VP_SG_ID                        0xb0000002u
@@ -933,7 +979,7 @@
  /*
   * The DSP can only reach memory within its own reserved region
   * (adsp_region@9fd00000, 49 MiB).  XNU's physical allocator manages only the
-@@ -1553,8 +2191,55 @@
+@@ -1553,8 +2237,55 @@
   */
  #define G_SHM_FIXED_PA                      0xa2d00000u
  
@@ -990,7 +1036,7 @@
  g_apm_cmd(uint32_t src_port, uint32_t dst_port, const uint8_t *payload,
      uint32_t plen, uint32_t opcode, const char *what)
  {
-@@ -1567,7 +2252,19 @@
+@@ -1567,7 +2298,19 @@
  	memset(pkt, 0, sizeof(pkt));
  	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
  	g_put32(pkt + 4, GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8));
@@ -1011,7 +1057,7 @@
  	g_put32(pkt + 12, dst_port);    /* 1 = APM, else module iid */
  	g_put32(pkt + 16, 0x100u + opcode);
  	g_put32(pkt + 20, opcode);
-@@ -1580,30 +2277,57 @@
+@@ -1580,30 +2323,57 @@
  	printf("SWEET GLINK: APM %s src=%#x dst=%#x (%u bytes)\n", what,
  	    src_port, dst_port, pkt_size);
  	sweet_log_sync();
@@ -1092,7 +1138,7 @@
  }
  
  /* The vendor HAL never inlines a graph payload: it maps one region once and
-@@ -1614,6 +2338,19 @@
+@@ -1614,6 +2384,19 @@
   * and the vendor's kprobe trace agree byte for byte). */
  static vm_offset_t g_shm_va;
  static uint64_t    g_shm_pa;
@@ -1112,7 +1158,7 @@
  static uint32_t    g_shm_handle;
  static int         g_shm_mapped;
  
-@@ -1622,6 +2359,185 @@
+@@ -1622,6 +2405,185 @@
   * The hand-built packet below put the body at offset 24, so the DSP read the
   * pool id as the payload size and answered AR_EBADPARAM.  Build the body in
   * a standalone array and let g_apm_cmd place it correctly. */
@@ -1298,7 +1344,7 @@
  /* The ADSP reaches DDR through the platform's apps-smmu (SMMU-500 at
   * 0x15000000, lpass_tbu at 0x151e9000, SID range 0x180000..0x1bffff).
   * Read-only probe: model, stream-match entries, and any existing mapping
-@@ -1631,33 +2522,787 @@
+@@ -1631,33 +2593,787 @@
  {
  	static bool done;
  	vm_offset_t v;
@@ -2100,7 +2146,7 @@
  }
  
  /* Prove whether the page pmap_find_phys reports is a real DRAM address:
-@@ -1672,12 +3317,30 @@
+@@ -1672,12 +3388,30 @@
  	vm_offset_t va = 0, mirror;
  	uint64_t pa;
  	uint32_t pn;
@@ -2132,7 +2178,7 @@
  	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		printf("SWEET PHYS: alloc failed\n");
  		return;
-@@ -1687,7 +3350,7 @@
+@@ -1687,7 +3421,7 @@
  	printf("SWEET PHYS: va=%#llx pa=%#llx\n", (uint64_t)va, pa);
  	*(volatile uint32_t *)va = 0x5a5a1234u;
  	__asm__ volatile("dsb sy" ::: "memory");
@@ -2141,7 +2187,7 @@
  	if (!mirror) {
  		printf("SWEET PHYS: mirror map failed\n");
  	} else {
-@@ -1696,52 +3359,111 @@
+@@ -1696,52 +3430,111 @@
  		printf("SWEET PHYS: mirror=%#x %s\n", v,
  		    v == 0x5a5a1234u ? "MATCH" : "MISMATCH");
  	}
@@ -2278,7 +2324,7 @@
  			return 0;
  		}
  	}
-@@ -1761,11 +3483,11 @@
+@@ -1761,11 +3554,11 @@
  		return 0;
  	}
  	if (!g_shm_va) {
@@ -2292,7 +2338,7 @@
  			sweet_log_sync();
  		}
  	}
-@@ -1780,7 +3502,7 @@
+@@ -1780,7 +3573,7 @@
  		for (unsigned i = 0; i < sizeof(lim) / sizeof(lim[0]); i++) {
  			vm_offset_t va = 0;
  
@@ -2301,7 +2347,7 @@
  			    PAGE_MASK, lim[i], 0,
  			    KMA_DATA | KMA_ZERO | KMA_PERMANENT,
  			    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-@@ -1790,7 +3512,7 @@
+@@ -1790,7 +3583,7 @@
  			}
  			pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
  			if (!pn) {
@@ -2310,7 +2356,7 @@
  				continue;
  			}
  			g_shm_va = va;
-@@ -1821,9 +3543,9 @@
+@@ -1821,9 +3614,9 @@
  	g_put32(pkt + 28, 4u);          /* property_flag, as the vendor sends */
  	g_put32(pkt + 32, (uint32_t)g_shm_pa);
  	g_put32(pkt + 36, (uint32_t)(g_shm_pa >> 32));
@@ -2322,7 +2368,7 @@
  	sweet_log_sync();
  	g_rsp_ready = 0;
  	g_rsp_len = 0;
-@@ -1904,16 +3626,19 @@
+@@ -1904,16 +3697,19 @@
  /* GRAPH_OPEN with the payload in the mapped region, as the vendor does. */
  static int
  g_apm_graph_open_shm(uint32_t src_port, const uint8_t *payload, uint32_t len,
@@ -2346,7 +2392,7 @@
  
  	memset(pkt, 0, sizeof(pkt));
  	g_put32(pkt + 0, (6u << 4) | (pkt_size << 8));
-@@ -1922,7 +3647,7 @@
+@@ -1922,7 +3718,7 @@
  	g_put32(pkt + 12, 1);
  	g_put32(pkt + 16, 0x400u);
  	g_put32(pkt + 20, APM_CMD_GRAPH_OPEN);
@@ -2355,7 +2401,7 @@
  	g_put32(pkt + 24 + 4, 0);
  	g_put32(pkt + 24 + 8, g_shm_handle);
  	g_put32(pkt + 24 + 12, len);
-@@ -1936,112 +3661,455 @@
+@@ -1936,112 +3732,455 @@
  		g_drain(0);
  		if (g_rsp_ready) {
  			break;
@@ -2913,7 +2959,7 @@
  	}
  	static int dbg;
  	if (!g_rsp_ready || g_rsp_len < 40) {
-@@ -2070,87 +4138,215 @@
+@@ -2070,87 +4209,215 @@
  			}
  			return -1;
  		}
@@ -3184,7 +3230,7 @@
  }
  
  /*
-@@ -2332,24 +4528,39 @@
+@@ -2332,24 +4599,39 @@
  	uint32_t v;
  	int rc;
  
@@ -3235,7 +3281,7 @@
  	}
  
  	/* TDM sink input: 96 kHz / 32 bit / 3 channels. */
-@@ -2361,12 +4572,34 @@
+@@ -2361,12 +4643,34 @@
  	mf[20] = 32; mf[21] = 0; mf[22] = 31; mf[23] = 0;
  	mf[24] = 1;  mf[25] = 0; mf[26] = 3;  mf[27] = 0;
  	mf[28] = 1;  mf[29] = 2; mf[30] = 3;
@@ -3274,7 +3320,7 @@
  	g_put32(mf + 0, 96000);
  	g_put32(mf + 4, 32u | (3u << 16));
  	g_put32(mf + 8, 1);
-@@ -2407,7 +4640,43 @@
+@@ -2407,7 +4711,43 @@
  	return g_apm_cmd(src_port, 1, pl, sizeof(pl), opcode, what);
  }
  
@@ -3318,7 +3364,7 @@
  g_apm_graph_start(uint32_t src_port, uint32_t sg_id)
  {
  	if (g_apm_graph_ctrl(src_port, sg_id, APM_CMD_GRAPH_PREPARE,
-@@ -2425,12 +4694,126 @@
+@@ -2425,12 +4765,126 @@
  g_apm_graph_bringup(void)
  {
  	/* The vendor's AGM clients send from 0x2010/0x2011. */
@@ -3449,7 +3495,7 @@
  	if (g_apm_cmd(port, 1, g_graph_vp, sizeof(g_graph_vp),
  	    APM_CMD_GRAPH_OPEN, "graph_open/vp-inline") == 0) {
  		g_audio_graph_cfg_vp(port);
-@@ -2448,7 +4831,8 @@
+@@ -2448,7 +4902,8 @@
  	 * command; a handle owned by another port may be rejected. */
  	if (g_apm_shm_map(port) == 0) {
  		if (g_apm_graph_open_shm(port, g_graph_vp,
@@ -3459,7 +3505,7 @@
  			g_audio_graph_cfg_vp(port);
  			if (g_apm_graph_start(port, APM_VP_SG_ID) == 0) {
  				g_audio_tone(port, G_VP_SAL_IID);
-@@ -2500,7 +4884,8 @@
+@@ -2500,7 +4955,8 @@
  		return;
  	}
  	if (g_apm_graph_open_shm(port, g_graph_open_payload,
@@ -3469,7 +3515,7 @@
  		g_audio_graph_cfg(port);
  		if (g_apm_graph_start(port, APM_GRAPH_SG_ID) == 0) {
  			/* The tone needs a mapped region for the PCM buffers. */
-@@ -2513,30 +4898,423 @@
+@@ -2513,30 +4969,523 @@
  		return;
  	}
  	if (g_apm_graph_open_shm(port, g_graph_vendor_payload,
@@ -3556,6 +3602,17 @@
 +		if (!g_batt_ready || g_batt_rsp_len < 24) {
 +			break;
 +		}
++		if (g_le32(g_batt_rsp + 4) == 2u) {
++			/* A firmware notice, not the answer to this request. */
++			if (g_batt_notices++ < 8) {
++				printf("SWEET BATT: notice %#x len=%u %#x %#x"
++				    " %#x\n", g_le32(g_batt_rsp + 8),
++				    g_batt_rsp_len, g_le32(g_batt_rsp + 12),
++				    g_le32(g_batt_rsp + 16),
++				    g_le32(g_batt_rsp + 20));
++			}
++			continue;
++		}
 +		result = g_le32(g_batt_rsp + 20);
 +		rprop = g_le32(g_batt_rsp + 12);
 +		v = g_le32(g_batt_rsp + 16);
@@ -3585,20 +3642,71 @@
 +		raw_shown++;
 +		g_dump(tag, g_batt_rsp, g_batt_rsp_len);
 +	}
-+	if (op == 0x30u && prop == 0) {
-+		g_batt_s_status = (int)v;
-+	} else if (op == 0x30u && prop == 4) {
-+		/* battmgr reports capacity in 0.01 % units (10000 = 100.00 %),
-+		 * not whole percent: without the /100 a 50 % battery reads as
-+		 * 5000 and SweetBattery clamps it to 100 %. */
-+		g_batt_s_cap = (int)(v / 100u);
-+	} else if (op == 0x30u && prop == 7) {
-+		g_batt_s_mv = (int)(v / 1000u);
-+	} else if (op == 0x30u && prop == 9) {
-+		/* Negative = charging, in microamps, two's complement. */
-+		g_batt_s_ma = (int)((int32_t)v / 1000);
-+	} else if (op == 0x32u && prop == 0) {
-+		g_batt_s_usb = (int)v;
++	if (op == BATT_GET) {
++		switch (prop) {
++		case BATT_P_STATUS:
++			g_batt_s_status = (int)v;
++			break;
++		case BATT_P_HEALTH:
++			g_batt_s_health = (int)v;
++			break;
++		case BATT_P_PRESENT:
++			g_batt_s_present = (int)v;
++			break;
++		case BATT_P_CAPACITY:
++			/* 0.01 % units (10000 = 100.00 %): without the /100 a
++			 * 50 % battery reads as 5000 and SweetBattery clamps
++			 * it to 100 %. */
++			g_batt_s_cap = (int)(v / 100u);
++			break;
++		case BATT_P_VOLT_NOW:
++			g_batt_s_mv = (int)(v / 1000u);
++			break;
++		case BATT_P_CURR_NOW:
++			/* uA, two's complement; positive while charging
++			 * (Linux's POWER_SUPPLY_CURRENT_NOW sign, -742 mA
++			 * while discharging on a reference device). */
++			g_batt_s_ma = (int)((int32_t)v / 1000);
++			break;
++		case BATT_P_TEMP_A:
++		case BATT_P_TEMP_B: {
++			int32_t t = (int32_t)v;
++
++			/* 0.01 degC.  Only the slot that looks like a pack
++			 * temperature is kept: the other one holds a large
++			 * vendor value (2000000 was seen) or technology (1). */
++			if (t > 500 && t < 9000) {
++				g_batt_s_temp = (int)t;
++			}
++			break;
++		}
++		case BATT_P_COUL_A:
++		case BATT_P_COUL_B:
++			if (v > 100000u && v < 20000000u) {
++				g_batt_s_coul = (int)v;
++			}
++			break;
++		case BATT_P_CYCLES:
++			if (v < 5000u) {
++				g_batt_s_cycles = (int)v;
++			}
++			break;
++		}
++	} else if (op == USB_GET) {
++		switch (prop) {
++		case USB_P_ONLINE:
++			g_batt_s_usb = (int)v;
++			break;
++		case USB_P_VOLT_NOW:
++			g_batt_s_usb_mv = (int)(v / 1000u);
++			break;
++		case USB_P_CURR_NOW:
++			g_batt_s_usb_ma = (int)((int32_t)v / 1000);
++			break;
++		case USB_P_TYPE:
++			g_batt_s_usb_type = (int)v;
++			break;
++		}
 +	}
 +	if (!quiet) {
 +		printf("SWEET BATT: %s op=%#x prop=%u value=%u\n", tag, op,
@@ -3610,7 +3718,7 @@
 +/*
 + * Periodic refresh: the initial probe is one-shot, so without this the
 + * cached capacity never changes and iOS shows the boot-time value forever.
-+ * SweetBattery polls every 30 s; ask battmgr again on the same cadence.
++ * SweetBattery polls every 3 s; refresh the whole set every 5 s.
 + */
 +static void
 +g_batt_tick(void)
@@ -3619,18 +3727,24 @@
 +	int ok = 0;
 +
 +	g_drain(0);
-+	ok += g_batt_req(0x30u, 0, "status", 1);
-+	ok += g_batt_req(0x30u, 4, "capacity", 1);
-+	ok += g_batt_req(0x30u, 7, "vbat", 1);
-+	ok += g_batt_req(0x30u, 9, "ibat", 1);
-+	ok += g_batt_req(0x32u, 0, "usb", 1);
-+	/* Poll every 3 s for a quick charger reaction; print every tenth
-+	 * tick (30 s) so the ring does not fill with identical lines. */
++	ok += g_batt_req(BATT_GET, BATT_P_STATUS, "status", 1);
++	ok += g_batt_req(BATT_GET, BATT_P_CAPACITY, "capacity", 1);
++	ok += g_batt_req(BATT_GET, BATT_P_VOLT_NOW, "vbat", 1);
++	ok += g_batt_req(BATT_GET, BATT_P_CURR_NOW, "ibat", 1);
++	ok += g_batt_req(BATT_GET, BATT_P_TEMP_B, "temp13", 1);
++	ok += g_batt_req(BATT_GET, BATT_P_TEMP_A, "temp12", 1);
++	ok += g_batt_req(USB_GET, USB_P_ONLINE, "usb", 1);
++	/* Poll every 5 s; print every sixth tick (30 s) so the ring does not
++	 * fill with identical lines. */
 +	tick_n++;
 +	if (tick_n % 6 == 1) {
-+		printf("SWEET BATT: tick %d ok=%d/5 cap=%d%% %dmV %dmA "
-+		    "status=%d usb=%d\n", tick_n, ok, g_batt_s_cap,
-+		    g_batt_s_mv, g_batt_s_ma, g_batt_s_status, g_batt_s_usb);
++		printf("SWEET BATT: tick %d ok=%d/7 cap=%d%% %dmV %dmA "
++		    "temp=%d.%02d status=%d usb=%d\n", tick_n, ok,
++		    g_batt_s_cap, g_batt_s_mv, g_batt_s_ma,
++		    g_batt_s_temp == -100000 ? -999 : g_batt_s_temp / 100,
++		    g_batt_s_temp == -100000 ? 0 :
++		    (g_batt_s_temp < 0 ? -g_batt_s_temp : g_batt_s_temp) % 100,
++		    g_batt_s_status, g_batt_s_usb);
 +		sweet_log_sync();
 +	}
 +}
@@ -3693,6 +3807,8 @@
 +	if (!on) {
 +		return;
 +	}
++	(void)PE_parse_boot_argn("sweetbattsweep", &g_batt_sweep,
++	    sizeof(g_batt_sweep));
 +	printf("SWEET BATT: opening %s\n", G_BATT_NAME);
 +	for (unsigned i = 0; i < G_BATT_NAME_LEN; i++) {
 +		name[i] = (uint8_t)G_BATT_NAME[i];
@@ -3726,18 +3842,48 @@
 +		printf("SWEET BATT: no pmic intent (rcid=%u)\n", g_batt_rcid);
 +		return;
 +	}
-+	/* enum battery_property_id from qti_battery_charger.c, and the
-+	 * BC_BATTERY_STATUS_GET / BC_USB_STATUS_GET opcodes. */
-+	(void)g_batt_req(0x30u, 0, "batt-status", 0);
-+	(void)g_batt_req(0x30u, 4, "capacity", 0);
-+	(void)g_batt_req(0x30u, 7, "vbat", 0);
-+	(void)g_batt_req(0x30u, 9, "ibat", 0);
-+	(void)g_batt_req(0x30u, 12, "temp", 0);
-+	(void)g_batt_req(0x32u, 0, "usb-online", 0);
++	/* Numbers from qcom_battmgr.c; 12/13 and 14/15 are the two possible
++	 * temperature/counter slots (see the property block above). */
++	(void)g_batt_req(BATT_GET, BATT_P_STATUS, "batt-status", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_HEALTH, "health", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_PRESENT, "present", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_CAPACITY, "capacity", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_VOLT_NOW, "vbat", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_CURR_NOW, "ibat", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_TEMP_B, "temp13", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_TEMP_A, "temp12", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_COUL_B, "coul15", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_COUL_A, "coul14", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_CYCLES, "cycles", 0);
++	(void)g_batt_req(USB_GET, USB_P_ONLINE, "usb-online", 0);
++	(void)g_batt_req(USB_GET, USB_P_VOLT_NOW, "usb-volt", 0);
++	(void)g_batt_req(USB_GET, USB_P_TYPE, "usb-type", 0);
++	printf("SWEET BATT: sample cap=%d%% %dmV %dmA temp=%d.%02d "
++	    "tempC=%d coul=%duAh cyc=%d health=%d present=%d "
++	    "usb=%d/%d/%dmV/%dmA\n",
++	    g_batt_s_cap, g_batt_s_mv, g_batt_s_ma,
++	    g_batt_s_temp == -100000 ? -999 : g_batt_s_temp / 100,
++	    g_batt_s_temp == -100000 ? 0 :
++	    (g_batt_s_temp < 0 ? -g_batt_s_temp : g_batt_s_temp) % 100,
++	    g_batt_s_temp, g_batt_s_coul, g_batt_s_cycles, g_batt_s_health,
++	    g_batt_s_present, g_batt_s_usb, g_batt_s_usb_type,
++	    g_batt_s_usb_mv, g_batt_s_usb_ma);
++	if (g_batt_sweep) {
++		uint32_t p;
++
++		printf("SWEET BATT: sweep battery 0..31\n");
++		for (p = 0; p < 32; p++) {
++			(void)g_batt_req(BATT_GET, p, "sweep-bat", 0);
++		}
++		printf("SWEET BATT: sweep usb 0..11\n");
++		for (p = 0; p < 12; p++) {
++			(void)g_batt_req(USB_GET, p, "sweep-usb", 0);
++		}
++	}
 +	/* The worker's first request is seconds away; if the channel dies
 +	 * right after the probe, this tells us in the same boot. */
 +	printf("SWEET BATT: immediate re-check\n");
-+	(void)g_batt_req(0x30u, 4, "capacity-now", 0);
++	(void)g_batt_req(BATT_GET, BATT_P_CAPACITY, "capacity-now", 0);
 +	{
 +		thread_t th;
 +
@@ -3878,7 +4024,7 @@
  	printf("SWEET GLINK: ===== minimal GLINK/GPR client =====\n");
 +	/* Build tag: watchers key on this so an intermediate kernel cannot be
 +	 * mistaken for the one that was just pushed.  Bump it every change. */
-+	printf("SWEET AUDIO: build v97 (battery refresh worker)\n");
++	printf("SWEET AUDIO: build v99 (battery property map + sweep)\n");
  
 -	/* RTC first, then haptics; dumps afterwards in case one NAKs. */
 +	/* RTC first, then haptics; dumps afterwards in case one NAKs.
@@ -3896,7 +4042,7 @@
  	g_rtc_set_from_pmic();
  	g_spmi_dump("rtc", 0, 0x6100, 16);
  	g_spmi_dump("hap", 3, 0xf000, 16);
-@@ -2587,6 +5365,7 @@
+@@ -2587,6 +5536,7 @@
  		}
  		printf("SWEET GLINK: %d intents advertised\n", g_nliids);
  		g_drain(100);
